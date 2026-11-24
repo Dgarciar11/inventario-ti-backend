@@ -2,31 +2,38 @@
 
 namespace App\Models;
 
-// use Illuminate\Contracts\Auth\MustVerifyEmail;
 use Database\Factories\UserFactory;
 use Illuminate\Database\Eloquent\Attributes\Fillable;
-use Illuminate\Database\Eloquent\Attributes\Hidden;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Foundation\Auth\User as Authenticatable;
 use Illuminate\Notifications\Notifiable;
+use Laravel\Sanctum\HasApiTokens;
 
-#[Fillable(['name', 'email', 'password'])]
-#[Hidden(['password', 'remember_token'])]
+// Campos que se pueden guardar
+#[Fillable([
+    'name',
+    'email',
+    'ldap_username',
+    'is_active',
+    'rol',
+    'last_login_at',
+])]
 class User extends Authenticatable
 {
-    /** @use HasFactory<UserFactory> */
-    use HasFactory, Notifiable;
+    // HasApiTokens: permite crear tokens para el login.
+    // HasFactory: permite usar UserFactory para pruebas.
+    // Notifiable: permite enviar notificaciones si más adelante se necesita.
+    use HasApiTokens, HasFactory, Notifiable;
 
-    /**
-     * Get the attributes that should be cast.
-     *
-     * @return array<string, string>
-     */
+    // Convierte los datos al tipo correcto al consultarlos o guardarlos.
     protected function casts(): array
     {
         return [
-            'email_verified_at' => 'datetime',
-            'password' => 'hashed',
+            // Guarda y lee "activo/inactivo" como verdadero o falso.
+            'is_active' => 'boolean',
+
+            // Guarda y lee la fecha del último inicio de sesión.
+            'last_login_at' => 'datetime',
         ];
     }
 }
