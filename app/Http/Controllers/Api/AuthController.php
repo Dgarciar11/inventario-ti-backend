@@ -2,15 +2,14 @@
 
 namespace App\Http\Controllers\Api;
 
-
-use App\Http\Controllers\Api\ApiController;
 use App\Models\User;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
 
 class AuthController extends ApiController
 {
-    // Inicia sesión validando al usuario contra Active Directory (LDAP).
+    // Valida las credenciales LDAP e inicia la sesión.
     public function login(Request $request): JsonResponse
     {
         // El frontend debe enviar usuario y contraseña.
@@ -23,12 +22,32 @@ class AuthController extends ApiController
         $username = trim($request->input('username'));
         $password = $request->input('password');
 
-        // Usuario de red completo
-        $ldapDn = 'CORP\\' . $username;
+        // Evitamos continuar si el usuario solo contiene espacios.
+        if ($username === '') {
+            return $this->error(
+                'Debes ingresar un usuario.',
+                422
+            );
+        }
 
-        // Datos de conexión LDAP desde .env.
-        $ldapHost = config('ldap.connections.default.hosts.0', env('LDAP_HOST'));
-        $ldapPort = env('LDAP_PORT', 389);
+        // Leemos la conexión LDAP configurada.
+        $connectionName = config('ldap.default', 'default');
+        $ldapConfig = config("ldap.connections.{$connectionName}", []);
+
+        $ldapHost = $ldapConfig['hosts'][0] ?? null;
+        $ldapPort = (int) ($ldapConfig['port'] ?? 389);
+        $baseDn = $ldapConfig['base_dn'] ?? null;
+
+        // Comprobamos que exista la configuración necesaria.
+        if (! $ldapHost || ! $baseDn) {
+            return $this->error(
+                'La conexión LDAP no está configurada correctamente.',
+                500
+            );
+        }
+
+        // Preparamos el usuario de red
+        $ldapDn = 'CORP\\' . $username;
 
         // Abrimos la conexión con el servidor LDAP.
         $connection = @ldap_connect($ldapHost, $ldapPort);
@@ -41,116 +60,120 @@ class AuthController extends ApiController
             );
         }
 
-        // Usamos LDAP versión 3 y evitamos redirecciones automáticas.
-        ldap_set_option($connection, LDAP_OPT_PROTOCOL_VERSION, 3);
-        ldap_set_option($connection, LDAP_OPT_REFERRALS, 0);
+        // Cerraremos la conexión aunque el proceso termine antes.
+        try{
+            // Configuramos la comunicación con Active Directory.
+            ldap_set_option($connection, LDAP_OPT_PROTOCOL_VERSION, 3);
+            ldap_set_option($connection, LDAP_OPT_REFERRALS, 0);
 
-        // Validamos el usuario y la contraseña contra Active Directory.
-        $bind = @ldap_bind($connection, $ldapDn, $password);
-
-        // Si las credenciales no son válidas, no permitimos entrar.
-        if (! $bind) {
-            return $this->error(
-                'Credenciales inválidas.',
-                401
+            // Limitamos la espera de la conexión.
+            ldap_set_option(
+                $connection,
+                LDAP_OPT_NETWORK_TIMEOUT,
+                (int)($ldapConfig['timeout'] ?? 5)
             );
-        }
 
-        // Buscamos al usuario dentro del dominio de la empresa.
-        $baseDn = env('LDAP_BASE_DN');
-        $filter = "(sAMAccountName={$username})";
+            // Validamos el usuario y la contraseña.
+            $bind = @ldap_bind($connection, $ldapDn, $password);
 
-        // Pedimos nombre, correo y usuario de red.
-        $search = @ldap_search(
-            $connection,
-            $baseDn,
-            $filter,
-            ['samaccountname', 'mail', 'cn', 'objectguid']
-        );
+            if (! $bind){
+                return $this->error(
+                    'No fue posible validar las credenciales con Active Directory.',
+                    401
+                );
+            }
 
-        // Si la búsqueda falla, cerramos la conexión y avisamos.
-        if (! $search) {
+            // Protegemos el usuario antes de incluirlo en la búsqueda.
+            $safeUsername = ldap_escape(
+                $username,
+                '',
+                LDAP_ESCAPE_FILTER
+            );
+
+            $filter = "(sAMAccountName={$safeUsername})";
+
+            // Consultamos el usuario, correo y nombre.
+            $search = @ldap_search(
+                $connection,
+                $baseDn,
+                $filter,
+                ['samaccountname', 'mail', 'cn']
+            );
+
+            if(! $search){
+                return $this->error(
+                    'No fue posible consultar el usuario en Active Directory.',
+                    502
+                );
+            }
+
+            // Leemos los resultados de la búsqueda.
+            $entries = ldap_get_entries($connection, $search);
+
+            if($entries===false || ($entries['count'] ?? 0) === 0){
+                return $this->error(
+                    'Usuario no encontrado en Active Directory.',
+                    401
+                );
+            }
+
+            // Extraemos los datos del usuario.
+            $ldapUser = $entries[0];
+            $ldapUsername = $ldapUser['samaccountname'][0] ?? $username;
+            $ldapEmail = $ldapUser['mail'][0] ?? null;
+            $ldapName = $ldapUser['cn'][0] ?? $username;
+
+            // Comprobamos si está autorizado en nuestra aplicación.
+            $user = User::query()
+                ->where('ldap_username', $ldapUsername)
+                ->first();
+
+            if(! $user){
+                return $this->error(
+                    'El usuario no está autorizado para usar el sistema.',
+                    403
+                );
+            }
+
+            // Impedimos el ingreso de usuarios inactivos.
+            if (! $user->is_active) {
+                return $this->error(
+                    'El usuario está inactivo, contacta al administrador.',
+                    403
+                );
+            }
+
+            // Actualizamos sus datos y registramos el acceso.
+            $user->forceFill([
+                'name' => $ldapName,
+                'email' => $ldapEmail ?: $user->email,
+                'last_login_at' => now(),
+            ])->save();
+
+            // Iniciamos sesión
+            Auth::guard('web')->login($user);
+
+            // Renovamos el identificador de la sesión.
+            $request ->session()->regenerate();
+
+            // Devolvemos el usuario, sin generar tokens de API.
+            return $this->success([
+                'user' => [
+                    'id' => $user->id,
+                    'name' => $user->name,
+                    'ldap_username' => $user->ldap_username,
+                    'email' => $user->email,
+                    'is_active' => $user->is_active,
+                    'rol' => $user->rol,
+                ],
+            ], 'Inicio de sesión exitoso.');
+        }finally{
+            // Liberamos siempre la conexión LDAP.
             ldap_unbind($connection);
-
-            return $this->error(
-                'No fue posible consultar el usuario en Active Directory.',
-                502
-            );
         }
-
-        // Leemos los resultados que devolvió Active Directory.
-        $entries = ldap_get_entries($connection, $search);
-
-        // Si AD no encontró al usuario, rechazamos el acceso.
-        if (($entries['count'] ?? 0) === 0) {
-            ldap_unbind($connection);
-
-            return $this->error(
-                'Usuario no encontrado en Active Directory.',
-                401
-            );
-        }
-
-        // Extraemos los datos principales del usuario.
-        $ldapUser = $entries[0];
-        $ldapUsername = $ldapUser['samaccountname'][0] ?? $username;
-        $ldapEmail = $ldapUser['mail'][0] ?? null;
-        $ldapName = $ldapUser['cn'][0] ?? $username;
-
-        // Buscamos si el usuario fue autorizado previamente en la aplicación.
-        $user = User::query()
-            ->where('ldap_username', $ldapUsername)
-            ->first();
-
-        // LDAP dice quién es, pero la base define quién puede usar el sistema.
-        if (! $user) {
-            ldap_unbind($connection);
-
-            return $this->error(
-                'El usuario no está autorizado para usar el sistema.',
-                403
-            );
-        }
-
-        // Los usuarios inactivos no pueden iniciar sesión.
-        if (! $user->is_active) {
-            ldap_unbind($connection);
-
-            return $this->error(
-                'El usuario está inactivo.',
-                403
-            );
-        }
-
-        // Actualizamos los datos desde AD y registramos el último acceso.
-        $user->forceFill([
-            'name' => $ldapName,
-            'email' => $ldapEmail ?: $user->email,
-            'last_login_at' => now(),
-        ])->save();
-
-        // Creamos el token que usará el frontend para las demás peticiones.
-        $token = $user->createToken('inventario-ti')->plainTextToken;
-
-        // Cerramos la conexión LDAP.
-        ldap_unbind($connection);
-
-        // Devolvemos el token y los datos del usuario.
-        return $this->success([
-            'token' => $token,
-            'token_type' => 'Bearer',
-            'user' => [
-                'id' => $user->id,
-                'name' => $user->name,
-                'ldap_username' => $user->ldap_username,
-                'email' => $user->email,
-                'is_active' => $user->is_active,
-                'rol' => $user->rol,
-            ],
-        ], 'Inicio de sesión exitoso.');
     }
 
-    // Devuelve los datos del usuario que está autenticado con el token.
+    // Devuelve el usuario autenticado.
     public function me(Request $request): JsonResponse
     {
         return $this->success([
@@ -158,10 +181,17 @@ class AuthController extends ApiController
         ]);
     }
 
-    // Elimina el token actual y cierra la sesión en este dispositivo.
+    // Cierra la sesión del navegador.
     public function logout(Request $request): JsonResponse
     {
-        $request->user()->currentAccessToken()->delete();
+        // Quitamos la autenticación de la sesión actual.
+        Auth::guard('web')->logout();
+
+        // Borramos la sesión y renovamos su identificador.
+        $request->session()->invalidate();
+
+        // Renovamos la protección de los formularios.
+        $request->session()->regenerateToken();
 
         return $this->success(
             [],
